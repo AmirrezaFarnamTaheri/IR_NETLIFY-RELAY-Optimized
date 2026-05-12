@@ -141,6 +141,9 @@ export default async function handler(request, context) {
         cache: "bypass",
       });
       responseStatus = response.status;
+      if (response.status >= 400) {
+        errorCode = response.headers.get("x-relay-error") || "cors_preflight_denied";
+      }
       return response;
     }
 
@@ -244,10 +247,23 @@ function handleReservedRoute(request, url, requestId, startedAt, context) {
       relay: "netlify-edge",
       version: VERSION,
       mode: "dynamic-x-host",
+      targetMode: "request-header-x-host",
       streaming: true,
       cors: "same-origin-only",
       timeoutMs: UPSTREAM_TIMEOUT_MS,
       privateNetworkBlocking: getPrivateNetworkBlockingMode(),
+      cache: "upstream-pass-through",
+      rateLimiting: "not-configured-in-relay",
+      redirectHandling: "rewrite-same-target-location",
+      cookieHandling: "pass-through-with-target-domain-cleanup",
+      safeRetries: {
+        enabled: true,
+        methods: [...RETRY_METHODS],
+        statuses: [...RETRY_STATUSES],
+        releasesRetryBodies: true,
+      },
+      duplicateSuppression: false,
+      reservedRoutes: [...RESERVED_ROUTES],
       requestId,
       region: getRegion(context),
     }, requestId, startedAt);
@@ -741,6 +757,7 @@ function handleCorsPreflight(request) {
       headers: {
         "cache-control": "no-store",
         "vary": "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+        "x-relay-error": "cors_origin_denied",
       },
     });
   }
