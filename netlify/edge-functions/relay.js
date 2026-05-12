@@ -141,6 +141,9 @@ export default async function handler(request, context) {
         cache: "bypass",
       });
       responseStatus = response.status;
+      if (response.status >= 400) {
+        errorCode = response.headers.get("x-relay-error") || "cors_preflight_denied";
+      }
       return response;
     }
 
@@ -248,6 +251,12 @@ function handleReservedRoute(request, url, requestId, startedAt, context) {
       cors: "same-origin-only",
       timeoutMs: UPSTREAM_TIMEOUT_MS,
       privateNetworkBlocking: getPrivateNetworkBlockingMode(),
+      safeRetries: {
+        enabled: true,
+        methods: [...RETRY_METHODS],
+        statuses: [...RETRY_STATUSES],
+      },
+      duplicateSuppression: false,
       requestId,
       region: getRegion(context),
     }, requestId, startedAt);
@@ -741,6 +750,7 @@ function handleCorsPreflight(request) {
       headers: {
         "cache-control": "no-store",
         "vary": "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+        "x-relay-error": "cors_origin_denied",
       },
     });
   }
