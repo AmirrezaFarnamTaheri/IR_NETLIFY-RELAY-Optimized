@@ -5,6 +5,10 @@ const UPSTREAM_TIMEOUT_MS = 30000;
 const ROOT_PAGE_TIMEOUT_MS = 5000;
 const MAX_X_HOST_LENGTH = 300;
 const MAX_URL_LENGTH = 8192;
+const RETRY_BACKOFF_MS = [100, 300];
+const DNS_CACHE_TTL_MS = 5 * 60 * 1000;
+const MAX_DNS_CACHE_ENTRIES = 1024;
+const DNS_CACHE_PRUNE_BATCH = 64;
 
 const STRIP_REQUEST_HEADERS = new Set([
   "host",
@@ -41,6 +45,26 @@ const BLOCKED_HOSTNAMES = new Set([
   "metadata.google.internal",
 ]);
 
+const BLOCKED_HOSTNAME_SUFFIXES = [
+  ".localhost",
+  ".local",
+  ".localdomain",
+  ".internal",
+  ".home.arpa",
+];
+
+const CORS_ALLOWED_REQUEST_HEADERS = new Set([
+  "accept",
+  "accept-language",
+  "authorization",
+  "content-language",
+  "content-type",
+  "if-modified-since",
+  "if-none-match",
+  "range",
+  "x-host",
+]);
+
 const SAFE_METHODS = new Set([
   "GET",
   "HEAD",
@@ -49,6 +73,18 @@ const SAFE_METHODS = new Set([
   "PATCH",
   "DELETE",
   "OPTIONS",
+]);
+
+const RETRY_METHODS = new Set([
+  "GET",
+  "HEAD",
+  "OPTIONS",
+]);
+
+const RETRY_STATUSES = new Set([
+  502,
+  503,
+  504,
 ]);
 
 const RESERVED_ROUTES = new Set([
@@ -62,6 +98,7 @@ const RESERVED_ROUTES = new Set([
 
 let cachedRootPage = null;
 let cachedRootPageUntil = 0;
+const dnsValidationCache = new Map();
 
 class RelayError extends Error {
   constructor(status, code, message) {
@@ -112,7 +149,7 @@ export default async function handler(request, context) {
     }
 
     targetInfo = resolveTarget(request, url);
-    validateTarget(targetInfo, url);
+    await validateTarget(targetInfo, url);
 
     const upstream = await fetchUpstream(request, targetInfo.url);
     upstreamStatus = upstream.status;
@@ -208,9 +245,9 @@ function handleReservedRoute(request, url, requestId, startedAt, context) {
       version: VERSION,
       mode: "dynamic-x-host",
       streaming: true,
-      cors: "automatic-origin-reflection",
+      cors: "same-origin-only",
       timeoutMs: UPSTREAM_TIMEOUT_MS,
-      privateNetworkBlocking: true,
+      privateNetworkBlocking: getPrivateNetworkBlockingMode(),
       requestId,
       region: getRegion(context),
     }, requestId, startedAt);
@@ -283,7 +320,7 @@ function resolveTarget(request, incomingUrl) {
 
   let baseUrl;
   if (/^https?:\/\//i.test(rawTarget)) {
-    baseUrl = new URL(rawTarget);
+    baseUrl = parseTargetUrl(rawTarget);
     if (baseUrl.username || baseUrl.password) {
       throw new RelayError(400, "target_credentials_blocked", "Error: target credentials are not allowed.");
     }
@@ -293,7 +330,7 @@ function resolveTarget(request, incomingUrl) {
     throw new RelayError(400, "invalid_x_host", "Error: x-host must be a hostname or URL.");
   } else {
     const protocol = inferProtocol(rawTarget);
-    baseUrl = new URL(`${protocol}${rawTarget}`);
+    baseUrl = parseTargetUrl(`${protocol}${rawTarget}`);
   }
 
   if (baseUrl.protocol !== "http:" && baseUrl.protocol !== "https:") {
@@ -315,6 +352,14 @@ function resolveTarget(request, incomingUrl) {
   };
 }
 
+function parseTargetUrl(value) {
+  try {
+    return new URL(value);
+  } catch {
+    throw new RelayError(400, "invalid_x_host", "Error: x-host must be a valid URL or hostname.");
+  }
+}
+
 function inferProtocol(host) {
   const lowerHost = host.toLowerCase();
   const isSecure =
@@ -324,7 +369,7 @@ function inferProtocol(host) {
   return isSecure ? "https://" : "http://";
 }
 
-function validateTarget(targetInfo, incomingUrl) {
+async function validateTarget(targetInfo, incomingUrl) {
   const targetHostname = normalizeHostname(targetInfo.hostname);
   const requestHostname = normalizeHostname(incomingUrl.hostname);
 
@@ -336,13 +381,20 @@ function validateTarget(targetInfo, incomingUrl) {
     throw new RelayError(508, "relay_loop_blocked", "Error: target points back to this relay.");
   }
 
-  if (BLOCKED_HOSTNAMES.has(targetHostname) || targetHostname.endsWith(".localhost")) {
+  if (isBlockedHostname(targetHostname)) {
     throw new RelayError(403, "private_target_blocked", "Error: private or local targets are blocked.");
   }
 
   if (isBlockedIpLiteral(targetHostname)) {
     throw new RelayError(403, "private_target_blocked", "Error: private or local targets are blocked.");
   }
+
+  await assertPublicDnsTarget(targetHostname);
+}
+
+function isBlockedHostname(hostname) {
+  if (BLOCKED_HOSTNAMES.has(hostname)) return true;
+  return BLOCKED_HOSTNAME_SUFFIXES.some((suffix) => hostname.endsWith(suffix));
 }
 
 function normalizeHostname(hostname) {
@@ -357,6 +409,15 @@ function isBlockedIpLiteral(hostname) {
   if (isBlockedIpv4(hostname)) return true;
   if (isBlockedIpv6(hostname)) return true;
   return false;
+}
+
+function isIpLiteral(hostname) {
+  return isIpv4Literal(hostname) || hostname.includes(":");
+}
+
+function isIpv4Literal(hostname) {
+  const parts = hostname.split(".");
+  return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part));
 }
 
 function isBlockedIpv4(hostname) {
@@ -390,17 +451,88 @@ function isBlockedIpv6(hostname) {
   return false;
 }
 
+async function assertPublicDnsTarget(hostname) {
+  if (isIpLiteral(hostname) || !canResolveDns()) return;
+
+  const cachedResult = dnsValidationCache.get(hostname);
+  if (cachedResult && cachedResult.expiresAt > Date.now()) {
+    if (cachedResult.blocked) {
+      throw new RelayError(403, "private_target_blocked", "Error: private or local targets are blocked.");
+    }
+    return;
+  }
+
+  const addresses = await resolveTargetAddresses(hostname);
+  const blocked = addresses.some((address) => isBlockedIpLiteral(normalizeHostname(address)));
+  pruneDnsValidationCache();
+  dnsValidationCache.set(hostname, {
+    blocked,
+    expiresAt: Date.now() + DNS_CACHE_TTL_MS,
+  });
+  enforceDnsValidationCacheLimit();
+
+  if (blocked) {
+    throw new RelayError(403, "private_target_blocked", "Error: private or local targets are blocked.");
+  }
+}
+
+function pruneDnsValidationCache() {
+  const now = Date.now();
+  let checked = 0;
+
+  for (const [hostname, cachedResult] of dnsValidationCache) {
+    if (cachedResult.expiresAt <= now) {
+      dnsValidationCache.delete(hostname);
+    }
+
+    checked += 1;
+    if (checked >= DNS_CACHE_PRUNE_BATCH) break;
+  }
+}
+
+function enforceDnsValidationCacheLimit() {
+  while (dnsValidationCache.size > MAX_DNS_CACHE_ENTRIES) {
+    const oldestKey = dnsValidationCache.keys().next().value;
+    if (!oldestKey) break;
+    dnsValidationCache.delete(oldestKey);
+  }
+}
+
+async function resolveTargetAddresses(hostname) {
+  const addresses = [];
+
+  for (const recordType of ["A", "AAAA"]) {
+    try {
+      const records = await Deno.resolveDns(hostname, recordType);
+      addresses.push(...records);
+    } catch {
+      // DNS lookup failures should not turn valid public hosts into relay errors.
+    }
+  }
+
+  return addresses;
+}
+
+function canResolveDns() {
+  return typeof Deno !== "undefined" && typeof Deno.resolveDns === "function";
+}
+
+function getPrivateNetworkBlockingMode() {
+  return canResolveDns() ? "dns-and-literal" : "literal-and-reserved-hostname";
+}
+
 async function fetchUpstream(request, targetUrl) {
   const method = request.method.toUpperCase();
   const headers = buildForwardHeaders(request);
-
-  return fetchWithTimeout(targetUrl.href, {
+  const fetchOptions = {
     timeoutMs: UPSTREAM_TIMEOUT_MS,
     method,
     headers,
     redirect: "manual",
     body: method !== "GET" && method !== "HEAD" ? request.body : undefined,
-  });
+  };
+
+  return fetchWithRetries(targetUrl.href, fetchOptions, method);
 }
 
 function buildForwardHeaders(request) {
@@ -440,6 +572,49 @@ function fetchWithTimeout(input, options) {
     ...fetchOptions,
     signal: controller.signal,
   }).finally(() => clearTimeout(timeout));
+}
+
+async function fetchWithRetries(input, options, method) {
+  const canRetry = RETRY_METHODS.has(method);
+  const maxAttempts = canRetry ? RETRY_BACKOFF_MS.length + 1 : 1;
+  let lastError = null;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      const response = await fetchWithTimeout(input, options);
+      if (!canRetry || !RETRY_STATUSES.has(response.status) || attempt === maxAttempts - 1) {
+        return response;
+      }
+      await releaseResponseBody(response);
+    } catch (error) {
+      lastError = error;
+      if (!canRetry || attempt === maxAttempts - 1) {
+        throw error;
+      }
+    }
+
+    await sleep(RETRY_BACKOFF_MS[attempt]);
+  }
+
+  throw lastError || new Error("Upstream fetch failed.");
+}
+
+async function releaseResponseBody(response) {
+  if (!response.body) return;
+
+  try {
+    await response.body.cancel();
+  } catch {
+    try {
+      await response.arrayBuffer();
+    } catch {
+      // Best-effort resource release before retrying.
+    }
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function buildProxyResponse(request, upstream, targetInfo, requestId, startedAt, context) {
@@ -560,10 +735,20 @@ function rewriteSetCookie(cookie, targetInfo) {
 }
 
 function handleCorsPreflight(request) {
-  const requestedHeaders = request.headers.get("access-control-request-headers") || "authorization,content-type,x-host";
+  if (!isTrustedCorsOrigin(request)) {
+    return new Response(null, {
+      status: 403,
+      headers: {
+        "cache-control": "no-store",
+        "vary": "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+      },
+    });
+  }
+
+  const allowedHeaders = getAllowedCorsRequestHeaders(request);
   const responseHeaders = new Headers({
     "access-control-allow-methods": "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS",
-    "access-control-allow-headers": requestedHeaders,
+    "access-control-allow-headers": allowedHeaders,
     "access-control-max-age": "86400",
     "cache-control": "public, max-age=86400",
     "vary": "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
@@ -574,12 +759,38 @@ function handleCorsPreflight(request) {
 }
 
 function applyCorsHeaders(headers, request) {
-  const origin = request.headers.get("origin");
-  if (!origin || /[\r\n]/.test(origin)) return;
+  if (!isTrustedCorsOrigin(request)) return;
 
+  const origin = request.headers.get("origin");
   headers.set("access-control-allow-origin", origin);
   headers.set("access-control-allow-credentials", "true");
   appendVary(headers, "Origin");
+}
+
+function isTrustedCorsOrigin(request) {
+  const origin = request.headers.get("origin");
+  if (!origin || /[\r\n]/.test(origin)) return false;
+
+  try {
+    const originUrl = new URL(origin);
+    const requestUrl = new URL(request.url);
+    if (originUrl.protocol !== "https:" && originUrl.protocol !== "http:") return false;
+    return normalizeHostname(originUrl.host) === normalizeHostname(requestUrl.host);
+  } catch {
+    return false;
+  }
+}
+
+function getAllowedCorsRequestHeaders(request) {
+  const requestedHeaders = request.headers.get("access-control-request-headers");
+  if (!requestedHeaders) return "authorization, content-type, x-host";
+
+  const allowedHeaders = requestedHeaders
+    .split(",")
+    .map((header) => header.trim().toLowerCase())
+    .filter((header) => CORS_ALLOWED_REQUEST_HEADERS.has(header));
+
+  return allowedHeaders.length ? allowedHeaders.join(", ") : "content-type";
 }
 
 function appendVary(headers, value) {
