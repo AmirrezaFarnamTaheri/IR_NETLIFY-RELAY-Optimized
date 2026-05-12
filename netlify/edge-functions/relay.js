@@ -5,9 +5,10 @@ const UPSTREAM_TIMEOUT_MS = 30000;
 const ROOT_PAGE_TIMEOUT_MS = 5000;
 const MAX_X_HOST_LENGTH = 300;
 const MAX_URL_LENGTH = 8192;
-const MAX_INFLIGHT_GETS = 256;
 const RETRY_BACKOFF_MS = [100, 300];
 const DNS_CACHE_TTL_MS = 5 * 60 * 1000;
+const MAX_DNS_CACHE_ENTRIES = 1024;
+const DNS_CACHE_PRUNE_BATCH = 64;
 
 const STRIP_REQUEST_HEADERS = new Set([
   "host",
@@ -97,7 +98,6 @@ const RESERVED_ROUTES = new Set([
 
 let cachedRootPage = null;
 let cachedRootPageUntil = 0;
-const inflightGets = new Map();
 const dnsValidationCache = new Map();
 
 class RelayError extends Error {
@@ -464,13 +464,37 @@ async function assertPublicDnsTarget(hostname) {
 
   const addresses = await resolveTargetAddresses(hostname);
   const blocked = addresses.some((address) => isBlockedIpLiteral(normalizeHostname(address)));
+  pruneDnsValidationCache();
   dnsValidationCache.set(hostname, {
     blocked,
     expiresAt: Date.now() + DNS_CACHE_TTL_MS,
   });
+  enforceDnsValidationCacheLimit();
 
   if (blocked) {
     throw new RelayError(403, "private_target_blocked", "Error: private or local targets are blocked.");
+  }
+}
+
+function pruneDnsValidationCache() {
+  const now = Date.now();
+  let checked = 0;
+
+  for (const [hostname, cachedResult] of dnsValidationCache) {
+    if (cachedResult.expiresAt <= now) {
+      dnsValidationCache.delete(hostname);
+    }
+
+    checked += 1;
+    if (checked >= DNS_CACHE_PRUNE_BATCH) break;
+  }
+}
+
+function enforceDnsValidationCacheLimit() {
+  while (dnsValidationCache.size > MAX_DNS_CACHE_ENTRIES) {
+    const oldestKey = dnsValidationCache.keys().next().value;
+    if (!oldestKey) break;
+    dnsValidationCache.delete(oldestKey);
   }
 }
 
@@ -508,28 +532,7 @@ async function fetchUpstream(request, targetUrl) {
     body: method !== "GET" && method !== "HEAD" ? request.body : undefined,
   };
 
-  if (!shouldCollapseRequest(request)) {
-    return fetchWithRetries(targetUrl.href, fetchOptions, method);
-  }
-
-  const collapseKey = buildInflightKey(request, targetUrl);
-  const existingRequest = inflightGets.get(collapseKey);
-  if (existingRequest) {
-    return existingRequest.then((response) => response.clone());
-  }
-
-  if (inflightGets.size >= MAX_INFLIGHT_GETS) {
-    const oldestKey = inflightGets.keys().next().value;
-    if (oldestKey) inflightGets.delete(oldestKey);
-  }
-
-  const upstreamRequest = fetchWithRetries(targetUrl.href, fetchOptions, method)
-    .finally(() => {
-      inflightGets.delete(collapseKey);
-    });
-
-  inflightGets.set(collapseKey, upstreamRequest);
-  return upstreamRequest.then((response) => response.clone());
+  return fetchWithRetries(targetUrl.href, fetchOptions, method);
 }
 
 function buildForwardHeaders(request) {
@@ -582,6 +585,7 @@ async function fetchWithRetries(input, options, method) {
       if (!canRetry || !RETRY_STATUSES.has(response.status) || attempt === maxAttempts - 1) {
         return response;
       }
+      await releaseResponseBody(response);
     } catch (error) {
       lastError = error;
       if (!canRetry || attempt === maxAttempts - 1) {
@@ -595,28 +599,18 @@ async function fetchWithRetries(input, options, method) {
   throw lastError || new Error("Upstream fetch failed.");
 }
 
-function shouldCollapseRequest(request) {
-  const method = request.method.toUpperCase();
-  if (method !== "GET" && method !== "HEAD") return false;
-  if (request.headers.has("authorization")) return false;
-  if (request.headers.has("cookie")) return false;
-  if (request.headers.has("range")) return false;
-  return true;
-}
+async function releaseResponseBody(response) {
+  if (!response.body) return;
 
-function buildInflightKey(request, targetUrl) {
-  const varyHeaders = [
-    "accept",
-    "accept-encoding",
-    "accept-language",
-    "if-none-match",
-    "if-modified-since",
-  ];
-  const headerKey = varyHeaders
-    .map((header) => `${header}:${request.headers.get(header) || ""}`)
-    .join("|");
-
-  return `${request.method.toUpperCase()} ${targetUrl.href} ${headerKey}`;
+  try {
+    await response.body.cancel();
+  } catch {
+    try {
+      await response.arrayBuffer();
+    } catch {
+      // Best-effort resource release before retrying.
+    }
+  }
 }
 
 function sleep(ms) {
