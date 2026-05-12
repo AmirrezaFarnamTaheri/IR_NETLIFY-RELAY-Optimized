@@ -5,6 +5,8 @@ const UPSTREAM_TIMEOUT_MS = 30000;
 const ROOT_PAGE_TIMEOUT_MS = 5000;
 const MAX_X_HOST_LENGTH = 300;
 const MAX_URL_LENGTH = 8192;
+const MAX_INFLIGHT_GETS = 256;
+const RETRY_BACKOFF_MS = [100, 300];
 
 const STRIP_REQUEST_HEADERS = new Set([
   "host",
@@ -51,6 +53,18 @@ const SAFE_METHODS = new Set([
   "OPTIONS",
 ]);
 
+const RETRY_METHODS = new Set([
+  "GET",
+  "HEAD",
+  "OPTIONS",
+]);
+
+const RETRY_STATUSES = new Set([
+  502,
+  503,
+  504,
+]);
+
 const RESERVED_ROUTES = new Set([
   "/_relay/health",
   "/_relay/help",
@@ -62,6 +76,7 @@ const RESERVED_ROUTES = new Set([
 
 let cachedRootPage = null;
 let cachedRootPageUntil = 0;
+const inflightGets = new Map();
 
 class RelayError extends Error {
   constructor(status, code, message) {
@@ -393,14 +408,36 @@ function isBlockedIpv6(hostname) {
 async function fetchUpstream(request, targetUrl) {
   const method = request.method.toUpperCase();
   const headers = buildForwardHeaders(request);
-
-  return fetchWithTimeout(targetUrl.href, {
+  const fetchOptions = {
     timeoutMs: UPSTREAM_TIMEOUT_MS,
     method,
     headers,
     redirect: "manual",
     body: method !== "GET" && method !== "HEAD" ? request.body : undefined,
-  });
+  };
+
+  if (!shouldCollapseRequest(request)) {
+    return fetchWithRetries(targetUrl.href, fetchOptions, method);
+  }
+
+  const collapseKey = buildInflightKey(request, targetUrl);
+  const existingRequest = inflightGets.get(collapseKey);
+  if (existingRequest) {
+    return existingRequest.then((response) => response.clone());
+  }
+
+  if (inflightGets.size >= MAX_INFLIGHT_GETS) {
+    const oldestKey = inflightGets.keys().next().value;
+    if (oldestKey) inflightGets.delete(oldestKey);
+  }
+
+  const upstreamRequest = fetchWithRetries(targetUrl.href, fetchOptions, method)
+    .finally(() => {
+      inflightGets.delete(collapseKey);
+    });
+
+  inflightGets.set(collapseKey, upstreamRequest);
+  return upstreamRequest.then((response) => response.clone());
 }
 
 function buildForwardHeaders(request) {
@@ -440,6 +477,58 @@ function fetchWithTimeout(input, options) {
     ...fetchOptions,
     signal: controller.signal,
   }).finally(() => clearTimeout(timeout));
+}
+
+async function fetchWithRetries(input, options, method) {
+  const canRetry = RETRY_METHODS.has(method);
+  const maxAttempts = canRetry ? RETRY_BACKOFF_MS.length + 1 : 1;
+  let lastError = null;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      const response = await fetchWithTimeout(input, options);
+      if (!canRetry || !RETRY_STATUSES.has(response.status) || attempt === maxAttempts - 1) {
+        return response;
+      }
+    } catch (error) {
+      lastError = error;
+      if (!canRetry || attempt === maxAttempts - 1) {
+        throw error;
+      }
+    }
+
+    await sleep(RETRY_BACKOFF_MS[attempt]);
+  }
+
+  throw lastError || new Error("Upstream fetch failed.");
+}
+
+function shouldCollapseRequest(request) {
+  const method = request.method.toUpperCase();
+  if (method !== "GET" && method !== "HEAD") return false;
+  if (request.headers.has("authorization")) return false;
+  if (request.headers.has("cookie")) return false;
+  if (request.headers.has("range")) return false;
+  return true;
+}
+
+function buildInflightKey(request, targetUrl) {
+  const varyHeaders = [
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "if-none-match",
+    "if-modified-since",
+  ];
+  const headerKey = varyHeaders
+    .map((header) => `${header}:${request.headers.get(header) || ""}`)
+    .join("|");
+
+  return `${request.method.toUpperCase()} ${targetUrl.href} ${headerKey}`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function buildProxyResponse(request, upstream, targetInfo, requestId, startedAt, context) {
